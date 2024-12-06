@@ -90,7 +90,7 @@ pair<int, int> getNext(pair<int, int> current, int direction) {
     return next;
 }
 
-bool isMapHaveLoop(pair<int, int> start, vector<vector<char>>& map, vector<vector<bitset<4>>>& directionMap, int direction) {
+bool isMapHaveLoop(pair<int, int> start, const vector<vector<char>>& map, vector<vector<bitset<4>>>& directionMap, int direction) {
     auto current = start;
     const int rowSize = map.size();
     const int colSize = map[0].size();
@@ -133,7 +133,8 @@ int solve(const vector<vector<char>>& map, const pair<int, int>& start,
     const int rowSize = map.size();
     const int colSize = map[0].size();
     auto current = start;
-    atomic<int> result{0};
+    vector<int> threadResults;
+    mutex resultsMutex;
 
     unordered_set<pair<int, int>, pair_hash> placedObstacles;
     
@@ -143,6 +144,8 @@ int solve(const vector<vector<char>>& map, const pair<int, int>& start,
 
     mutex placedObstaclesMutex;
 
+    vector<pair<pair<int, int>, int>> tasksToProcess;
+    
     while (true) {
         auto next = getNext(current, direction);
         if (next.first < 0 || next.first >= rowSize || next.second < 0 || next.second >= colSize) {
@@ -160,15 +163,7 @@ int solve(const vector<vector<char>>& map, const pair<int, int>& start,
             }
 
             if (shouldProcess) {
-                auto tempMap = map;
-                tempMap[next.first][next.second] = '#';
-                auto tempDirectionMap = vector<vector<bitset<4>>>(rowSize, vector<bitset<4>>(colSize));
-                
-                futures.push_back(pool.enqueue([&result, start=current, tempMap, tempDirectionMap=move(tempDirectionMap), dir=direction]() mutable {
-                    if (isMapHaveLoop(start, tempMap, tempDirectionMap, dir)) {
-                        result++;
-                    }
-                }));
+                tasksToProcess.push_back({current, direction});
             }
         }
         if (map[next.first][next.second] == '#') {
@@ -179,11 +174,35 @@ int solve(const vector<vector<char>>& map, const pair<int, int>& start,
         }
     }
 
+    for (const auto& task : tasksToProcess) {
+        auto [pos, dir] = task;
+        auto tempMap = map;
+        auto tempDirectionMap = vector<vector<bitset<4>>>(rowSize, vector<bitset<4>>(colSize));
+        
+        auto currentPos = pos;
+        auto currentDir = dir;
+        
+        auto nextPos = getNext(currentPos, currentDir);
+        if (nextPos.first >= 0 && nextPos.first < rowSize && 
+            nextPos.second >= 0 && nextPos.second < colSize) {
+            tempMap[nextPos.first][nextPos.second] = '#';
+        }
+        
+        futures.push_back(pool.enqueue(
+            [&threadResults, &resultsMutex, start=currentPos, tempMap, 
+             tempDirectionMap=std::move(tempDirectionMap), dir=currentDir]() mutable {
+                if (isMapHaveLoop(start, tempMap, tempDirectionMap, dir)) {
+                    lock_guard<mutex> lock(resultsMutex);
+                    threadResults.push_back(1);
+                }
+            }));
+    }
+
     for (auto& f : futures) {
         f.get();
     }
 
-    return result;
+    return threadResults.size();
 }
 
 int main() {
