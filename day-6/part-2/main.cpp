@@ -3,9 +3,71 @@
 #include <fstream>
 #include <sstream>
 #include <unordered_map>
+#include <unordered_set>
 #include <algorithm>
+#include <future>
+#include <chrono>
+#include <bitset>
+#include <thread>
+#include <queue>
+#include <mutex>
+#include <condition_variable>
 
 using namespace std;
+
+class ThreadPool {
+public:
+    ThreadPool(size_t threads) : stop(false) {
+        for(size_t i = 0; i < threads; ++i)
+            workers.emplace_back([this] {
+                while(true) {
+                    function<void()> task;
+                    {
+                        unique_lock<mutex> lock(this->queue_mutex);
+                        this->condition.wait(lock,
+                            [this]{ return this->stop || !this->tasks.empty(); });
+                        if(this->stop && this->tasks.empty())
+                            return;
+                        task = move(this->tasks.front());
+                        this->tasks.pop();
+                    }
+                    task();
+                }
+            });
+    }
+
+    template<class F>
+    future<typename result_of<F()>::type> enqueue(F&& f) {
+        using return_type = typename result_of<F()>::type;
+        auto task = make_shared<packaged_task<return_type()>>(forward<F>(f));
+        future<return_type> res = task->get_future();
+        {
+            unique_lock<mutex> lock(queue_mutex);
+            if(stop)
+                throw runtime_error("enqueue on stopped ThreadPool");
+            tasks.emplace([task](){ (*task)(); });
+        }
+        condition.notify_one();
+        return res;
+    }
+
+    ~ThreadPool() {
+        {
+            unique_lock<mutex> lock(queue_mutex);
+            stop = true;
+        }
+        condition.notify_all();
+        for(thread &worker: workers)
+            worker.join();
+    }
+
+private:
+    vector<thread> workers;
+    queue<function<void()>> tasks;
+    mutex queue_mutex;
+    condition_variable condition;
+    bool stop;
+};
 
 void updateDirection(int& direction) {
     direction = (direction + 1) % 4;
@@ -28,10 +90,12 @@ pair<int, int> getNext(pair<int, int> current, int direction) {
     return next;
 }
 
-bool isMapHaveLoop(pair<int, int> start, vector<vector<char>> map, vector<vector<vector<int>>> directionMap, int direction) {
+bool isMapHaveLoop(pair<int, int> start, vector<vector<char>>& map, vector<vector<bitset<4>>>& directionMap, int direction) {
     auto current = start;
-    int rowSize = map.size();
-    int colSize = map[0].size();
+    const int rowSize = map.size();
+    const int colSize = map[0].size();
+    
+    directionMap[current.first][current.second].set(direction);
     
     while (true) {
         auto next = getNext(current, direction);
@@ -43,31 +107,41 @@ bool isMapHaveLoop(pair<int, int> start, vector<vector<char>> map, vector<vector
             updateDirection(direction);
         }
         else {
-            if (directionMap[next.first][next.second].size() > 0) {
-                for (int dir : directionMap[next.first][next.second]) {
-                    if (dir == direction) return true;
-                }
+            if (directionMap[next.first][next.second].test(direction)) {
+                return true;
             }
             current = next;
-            directionMap[current.first][current.second].push_back(direction);
+            directionMap[current.first][current.second].set(direction);
         }
     }
     return false;
 }
 
-int solve(vector<vector<char>> map, pair<int, int> start, unordered_map<int, vector<int>> rowObstacles, unordered_map<int, vector<int>> colObstacles) {
-    int direction = 0; // 0: up, 1: right, 2: down, 3: left
+struct pair_hash {
+    template <class T1, class T2>
+    size_t operator () (const pair<T1, T2>& p) const {
+            auto h1 = hash<T1>{}(p.first);
+            auto h2 = hash<T2>{}(p.second);
+            return h1 ^ (h2 << 1);
+    }
+};
 
-
-    int rowSize = map.size();
-    int colSize = map[0].size();
+int solve(const vector<vector<char>>& map, const pair<int, int>& start, 
+         const unordered_map<int, vector<int>>& rowObstacles, 
+         const unordered_map<int, vector<int>>& colObstacles) {
+    int direction = 0;
+    const int rowSize = map.size();
+    const int colSize = map[0].size();
     auto current = start;
+    atomic<int> result{0};
 
-    int result = 0;
+    unordered_set<pair<int, int>, pair_hash> placedObstacles;
+    
+    const unsigned int threadCount = thread::hardware_concurrency();
+    ThreadPool pool(threadCount);
+    vector<future<void>> futures;
 
-    vector<vector<vector<int>>> directionMap(rowSize, vector<vector<int>>(colSize, vector<int>(0)));
-
-    vector<pair<int, int>> placedObstacles;
+    mutex placedObstaclesMutex;
 
     while (true) {
         auto next = getNext(current, direction);
@@ -76,28 +150,25 @@ int solve(vector<vector<char>> map, pair<int, int> start, unordered_map<int, vec
         }
         
         if (map[next.first][next.second] == '.') {
-            bool isPlaceObstacle = false;
-            for (auto obstacle : placedObstacles) {
-                if (obstacle.first == next.first && obstacle.second == next.second) {
-                    isPlaceObstacle = true;
-                    break;
+            bool shouldProcess = false;
+            {
+                lock_guard<mutex> lock(placedObstaclesMutex);
+                if (placedObstacles.find(next) == placedObstacles.end()) {
+                    placedObstacles.insert(next);
+                    shouldProcess = true;
                 }
             }
-            if (!isPlaceObstacle) {
+
+            if (shouldProcess) {
                 auto tempMap = map;
                 tempMap[next.first][next.second] = '#';
+                auto tempDirectionMap = vector<vector<bitset<4>>>(rowSize, vector<bitset<4>>(colSize));
                 
-                if (isMapHaveLoop(current, tempMap, directionMap, direction)) {
-                    // cout << next.first << " " << next.second << endl;
-                    // for (auto row : tempMap) {
-                    //     for (auto cell : row) {
-                    //         cout << cell;
-                    //     }
-                    //     cout << endl;
-                    // }
-                    result++;
-                }
-                placedObstacles.push_back(next);
+                futures.push_back(pool.enqueue([&result, start=current, tempMap, tempDirectionMap=move(tempDirectionMap), dir=direction]() mutable {
+                    if (isMapHaveLoop(start, tempMap, tempDirectionMap, dir)) {
+                        result++;
+                    }
+                }));
             }
         }
         if (map[next.first][next.second] == '#') {
@@ -105,14 +176,19 @@ int solve(vector<vector<char>> map, pair<int, int> start, unordered_map<int, vec
         }
         else {
             current = next;
-            directionMap[current.first][current.second].push_back(direction);
         }
     }
+
+    for (auto& f : futures) {
+        f.get();
+    }
+
     return result;
 }
 
-
 int main() {
+    auto start_time = chrono::high_resolution_clock::now();
+
     ifstream inputFile("input.txt");
     // ifstream inputFile("input-test.txt");
 
@@ -142,6 +218,10 @@ int main() {
 
     int result = solve(map, start, rowObstacles, colObstacles);
     cout << result << endl;
+
+    auto end_time = chrono::high_resolution_clock::now();
+    auto duration = chrono::duration_cast<chrono::milliseconds>(end_time - start_time);
+    cout << "Execution time: " << duration.count() << " ms" << endl;
 
     return 0;
 }
